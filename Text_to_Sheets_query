@@ -1,0 +1,136 @@
+```javascript
+/**
+ * n8n Code node (JavaScript) — robust parser for chat-style orders
+ * INPUT : items[0].json.user_message  (string)
+ * OUTPUT: multiple items like { Date, Item, Quantity } ready for Sheets/DB
+ */
+
+const raw = (items[0]?.json?.user_message ?? "").toString();
+
+// ---------- helpers ----------
+const normalize = (s) =>
+  s
+    .replace(/\r/g, "")
+    .replace(/[：]/g, ":")      // full-width colon
+    .replace(/[–—]/g, "-")      // en/em dash
+    .replace(/\u200B/g, "")     // zero-width space
+    .replace(/\s{2,}/g, " ")
+    .trim();
+
+const detectDateInline = (s) => {
+  const patterns = [
+    /\b(\d{1,2}\s+[A-Za-z]{3,}\s+\d{4})\b/,   // 12 June 2025
+    /\b(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})\b/,// 12/06/2025 or 12-06-25
+    /\b(\d{4}[\/\-]\d{1,2}[\/\-]\d{1,2})\b/,  // 2025-06-12
+  ];
+  for (const re of patterns) {
+    const m = s.match(re);
+    if (m) return m[1];
+  }
+  return "";
+};
+
+// Parse a single line → token
+const parseLine = (line) => {
+  const L = normalize(line).replace(/\b(\d{1,2}:\d{2})\b\s*$/, ""); // drop chat time like "04:57"
+  if (!L) return { type: "blank" };
+
+  // Date with label
+  let m = L.match(/\bdate\b\s*[:\-]\s*(.+)$/i);
+  if (m) return { type: "date", date: m[1].trim() };
+
+  // Quantity with label (qty/quantity)
+  m = L.match(/\bq(?:ty|uantity)\b\s*[:\-x×]?\s*([0-9]+(?:\.[0-9]+)?)\b/i);
+  if (m) return { type: "qty", qty: Number(m[1]) };
+
+  // Item with label
+  m = L.match(/\bitem\b\s*[:\-]\s*(.+)$/i);
+  if (m) return { type: "item", item: m[1].trim() };
+
+  // Pair patterns (item + qty on one line)
+  // a) "item : 15" OR "item - 15"
+  m = L.match(/^(.+?)\s*[:\-]\s*([0-9]+(?:\.[0-9]+)?)$/);
+  if (m) return { type: "pair", item: m[1].trim(), qty: Number(m[2]) };
+
+  // b) "item x 15"
+  m = L.match(/^(.+?)\s*[x×]\s*([0-9]+(?:\.[0-9]+)?)$/i);
+  if (m) return { type: "pair", item: m[1].trim(), qty: Number(m[2]) };
+
+  // c) "15 x item"
+  m = L.match(/^([0-9]+(?:\.[0-9]+)?)\s*[x×]\s*(.+)$/i);
+  if (m) return { type: "pair", item: m[2].trim(), qty: Number(m[1]) };
+
+  // d) "item qty 15"
+  m = L.match(/^(.+?)\s+q(?:ty|uantity)\.?\s*[:\-]?\s*([0-9]+(?:\.[0-9]+)?)$/i);
+  if (m) return { type: "pair", item: m[1].trim(), qty: Number(m[2]) };
+
+  // Bare date (e.g., "12 June 2025")
+  const inlineDate = detectDateInline(L);
+  if (inlineDate && (/^on\s+/i.test(L) || L === inlineDate)) {
+    return { type: "date", date: inlineDate };
+  }
+
+  // Fallback: treat as a loose item; we'll pair when qty shows up
+  return { type: "itemLoose", item: L };
+};
+
+// ---------- main ----------
+const lines = normalize(raw).split("\n").map(s => s.trim()).filter(Boolean);
+
+let currentDate = "";
+let pendingItem = null;
+let pendingQty = null;
+const rows = [];
+
+for (const line of lines) {
+  const tok = parseLine(line);
+
+  switch (tok.type) {
+    case "date":
+      currentDate = tok.date || detectDateInline(line) || currentDate;
+      break;
+
+    case "pair":
+      rows.push({ Date: currentDate, Item: tok.item, Quantity: tok.qty });
+      pendingItem = null;
+      pendingQty = null;
+      break;
+
+    case "item":
+    case "itemLoose":
+      if (pendingQty != null) {
+        rows.push({ Date: currentDate, Item: tok.item, Quantity: pendingQty });
+        pendingQty = null;
+      } else {
+        if (pendingItem) {
+          rows.push({ Date: currentDate, Item: pendingItem, Quantity: null });
+        }
+        pendingItem = tok.item;
+      }
+      break;
+
+    case "qty":
+      if (pendingItem) {
+        rows.push({ Date: currentDate, Item: pendingItem, Quantity: tok.qty });
+        pendingItem = null;
+      } else {
+        pendingQty = tok.qty;
+      }
+      break;
+
+    default:
+      // ignore blanks
+      break;
+  }
+}
+
+// flush any dangling item
+if (pendingItem) rows.push({ Date: currentDate, Item: pendingItem, Quantity: pendingQty ?? null });
+
+// clean & return n8n items
+const cleaned = rows
+  .map(r => ({ Date: r.Date || "", Item: (r.Item || "").trim(), Quantity: (r.Quantity ?? null) }))
+  .filter(r => r.Item || r.Quantity !== null);
+
+return cleaned.map(r => ({ json: r }));
+```
