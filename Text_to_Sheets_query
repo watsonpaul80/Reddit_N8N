@@ -1,136 +1,138 @@
 ```javascript
 /**
- * n8n Code node (JavaScript) — robust parser for chat-style orders
- * INPUT : items[0].json.user_message  (string)
- * OUTPUT: multiple items like { Date, Item, Quantity } ready for Sheets/DB
+ * n8n Code node, JavaScript, Run Once for All Items.
+ * INPUT: one item with json.user_message (string).
+ * OUTPUT: { json: { Date, Item, Quantity } } rows for Sheets/DB.
+ * Missing quantities remain null. Invalid/orphan quantities stop the node
+ * with a line number so orders cannot silently disappear.
  */
+const inputItems = typeof $input !== "undefined" ? $input.all() : items;
+if (inputItems.length > 1) {
+  throw new Error("Expected one input message. Process each message separately before this Code node.");
+}
+const raw = inputItems[0]?.json?.user_message ?? "";
+if (typeof raw !== "string") {
+  throw new Error("user_message must be a string.");
+}
 
-const raw = (items[0]?.json?.user_message ?? "").toString();
+// Normalize each line separately: blank lines must never merge records.
+const normalize = (line) => line
+  .replace(/：/g, ":")
+  .replace(/[–—]/g, "-")
+  .replace(/\u200B/g, "")
+  .replace(/[^\S\r\n]+/g, " ")
+  .trim();
 
-// ---------- helpers ----------
-const normalize = (s) =>
-  s
-    .replace(/\r/g, "")
-    .replace(/[：]/g, ":")      // full-width colon
-    .replace(/[–—]/g, "-")      // en/em dash
-    .replace(/\u200B/g, "")     // zero-width space
-    .replace(/\s{2,}/g, " ")
-    .trim();
-
-const detectDateInline = (s) => {
-  const patterns = [
-    /\b(\d{1,2}\s+[A-Za-z]{3,}\s+\d{4})\b/,   // 12 June 2025
-    /\b(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})\b/,// 12/06/2025 or 12-06-25
-    /\b(\d{4}[\/\-]\d{1,2}[\/\-]\d{1,2})\b/,  // 2025-06-12
-  ];
-  for (const re of patterns) {
-    const m = s.match(re);
-    if (m) return m[1];
-  }
-  return "";
+const fail = (line, message) => {
+  throw new Error(`Line ${line}: ${message}`);
 };
 
-// Parse a single line → token
-const parseLine = (line) => {
-  const L = normalize(line).replace(/\b(\d{1,2}:\d{2})\b\s*$/, ""); // drop chat time like "04:57"
-  if (!L) return { type: "blank" };
-
-  // Date with label
-  let m = L.match(/\bdate\b\s*[:\-]\s*(.+)$/i);
-  if (m) return { type: "date", date: m[1].trim() };
-
-  // Quantity with label (qty/quantity)
-  m = L.match(/\bq(?:ty|uantity)\b\s*[:\-x×]?\s*([0-9]+(?:\.[0-9]+)?)\b/i);
-  if (m) return { type: "qty", qty: Number(m[1]) };
-
-  // Item with label
-  m = L.match(/\bitem\b\s*[:\-]\s*(.+)$/i);
-  if (m) return { type: "item", item: m[1].trim() };
-
-  // Pair patterns (item + qty on one line)
-  // a) "item : 15" OR "item - 15"
-  m = L.match(/^(.+?)\s*[:\-]\s*([0-9]+(?:\.[0-9]+)?)$/);
-  if (m) return { type: "pair", item: m[1].trim(), qty: Number(m[2]) };
-
-  // b) "item x 15"
-  m = L.match(/^(.+?)\s*[x×]\s*([0-9]+(?:\.[0-9]+)?)$/i);
-  if (m) return { type: "pair", item: m[1].trim(), qty: Number(m[2]) };
-
-  // c) "15 x item"
-  m = L.match(/^([0-9]+(?:\.[0-9]+)?)\s*[x×]\s*(.+)$/i);
-  if (m) return { type: "pair", item: m[2].trim(), qty: Number(m[1]) };
-
-  // d) "item qty 15"
-  m = L.match(/^(.+?)\s+q(?:ty|uantity)\.?\s*[:\-]?\s*([0-9]+(?:\.[0-9]+)?)$/i);
-  if (m) return { type: "pair", item: m[1].trim(), qty: Number(m[2]) };
-
-  // Bare date (e.g., "12 June 2025")
-  const inlineDate = detectDateInline(L);
-  if (inlineDate && (/^on\s+/i.test(L) || L === inlineDate)) {
-    return { type: "date", date: inlineDate };
+const quantity = (text, line) => {
+  if (!/^\d+(?:\.\d+)?$/.test(text)) {
+    fail(line, "Quantity must be a non-negative number, for example Qty: 2 or Qty: 1.5.");
   }
-
-  // Fallback: treat as a loose item; we'll pair when qty shows up
-  return { type: "itemLoose", item: L };
+  const value = Number(text);
+  if (!Number.isFinite(value) || value > Number.MAX_SAFE_INTEGER) {
+    fail(line, "Quantity is too large to represent reliably.");
+  }
+  return value;
 };
 
-// ---------- main ----------
-const lines = normalize(raw).split("\n").map(s => s.trim()).filter(Boolean);
+const parseLine = (line, number) => {
+  // Preserve line boundaries while allowing an optional trailing chat time.
+  const text = normalize(line).replace(/\s+\d{1,2}:\d{2}$/, "").trim();
+  if (!text) return { type: "blank" };
+
+  let match = text.match(/^date\s*[:\-]\s*(.*)$/i);
+  if (match) {
+    if (!match[1]) fail(number, "Date label needs a value.");
+    return { type: "date", value: match[1] };
+  }
+
+  // Dates must precede pair matching: 12-06-2025 is not item 12-06, qty 2025.
+  match = text.match(/^(?:on\s+)?(\d{1,2}\s+[A-Za-z]{3,}\s+\d{4}|\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}|\d{4}[\/\-]\d{1,2}[\/\-]\d{1,2})$/i);
+  if (match) return { type: "date", value: match[1] };
+
+  match = text.match(/^item\s*[:\-]\s*(.*)$/i);
+  if (match) {
+    if (!match[1]) fail(number, "Item label needs a name.");
+    return { type: "item", value: match[1] };
+  }
+
+  // Anchor labels so "Apple qty 2" reaches the inline pair matcher below.
+  match = text.match(/^q(?:ty|uantity)\.?\s*(?::|[x×]|-\s+)?\s*(.*)$/i);
+  if (match && /^q(?:ty|uantity)\b/i.test(text)) {
+    return { type: "qty", value: quantity(match[1], number) };
+  }
+
+  match = text.match(/^(.+?)\s+q(?:ty|uantity)\b\.?\s*:?\s*(.*)$/i);
+  if (match) {
+    return { type: "pair", item: match[1].trim(), qty: quantity(match[2], number) };
+  }
+
+  // item : 15, item - 15, item x 15, and 15 x item.
+  match = text.match(/^(.+?)\s+[x×]\s*(-?\d+(?:\.\d+)?)$/i);
+  if (match) return { type: "pair", item: match[1].trim(), qty: quantity(match[2], number) };
+  match = text.match(/^(-?\d+(?:\.\d+)?)\s*[x×]\s+(.+)$/i);
+  if (match) return { type: "pair", item: match[2].trim(), qty: quantity(match[1], number) };
+  match = text.match(/^(.+?)\s*[:\-]\s*(-?\d+(?:\.\d+)?)$/);
+  if (match) return { type: "pair", item: match[1].trim(), qty: quantity(match[2], number) };
+
+  // Unlabelled text stays visible as an item; do not guess a missing quantity.
+  return { type: "item", value: text };
+};
 
 let currentDate = "";
 let pendingItem = null;
 let pendingQty = null;
 const rows = [];
 
-for (const line of lines) {
-  const tok = parseLine(line);
+const flushItem = () => {
+  if (pendingItem) {
+    rows.push({ Date: pendingItem.date, Item: pendingItem.value, Quantity: null });
+    pendingItem = null;
+  }
+};
+const rejectOrphanQty = () => {
+  if (pendingQty) fail(pendingQty.line, "Quantity has no item. Add an item before the next date or complete order.");
+};
 
-  switch (tok.type) {
+const lines = raw.replace(/\r\n?/g, "\n").split("\n");
+for (let index = 0; index < lines.length; index++) {
+  const number = index + 1;
+  const token = parseLine(lines[index], number);
+  switch (token.type) {
     case "date":
-      currentDate = tok.date || detectDateInline(line) || currentDate;
+      rejectOrphanQty();
+      flushItem();
+      currentDate = token.value;
       break;
-
     case "pair":
-      rows.push({ Date: currentDate, Item: tok.item, Quantity: tok.qty });
-      pendingItem = null;
-      pendingQty = null;
+      rejectOrphanQty();
+      flushItem();
+      rows.push({ Date: currentDate, Item: token.item, Quantity: token.qty });
       break;
-
     case "item":
-    case "itemLoose":
-      if (pendingQty != null) {
-        rows.push({ Date: currentDate, Item: tok.item, Quantity: pendingQty });
+      if (pendingQty) {
+        rows.push({ Date: currentDate, Item: token.value, Quantity: pendingQty.value });
         pendingQty = null;
       } else {
-        if (pendingItem) {
-          rows.push({ Date: currentDate, Item: pendingItem, Quantity: null });
-        }
-        pendingItem = tok.item;
+        flushItem();
+        pendingItem = { value: token.value, date: currentDate };
       }
       break;
-
     case "qty":
       if (pendingItem) {
-        rows.push({ Date: currentDate, Item: pendingItem, Quantity: tok.qty });
+        rows.push({ Date: pendingItem.date, Item: pendingItem.value, Quantity: token.value });
         pendingItem = null;
       } else {
-        pendingQty = tok.qty;
+        rejectOrphanQty();
+        pendingQty = { value: token.value, line: number };
       }
-      break;
-
-    default:
-      // ignore blanks
       break;
   }
 }
-
-// flush any dangling item
-if (pendingItem) rows.push({ Date: currentDate, Item: pendingItem, Quantity: pendingQty ?? null });
-
-// clean & return n8n items
-const cleaned = rows
-  .map(r => ({ Date: r.Date || "", Item: (r.Item || "").trim(), Quantity: (r.Quantity ?? null) }))
-  .filter(r => r.Item || r.Quantity !== null);
-
-return cleaned.map(r => ({ json: r }));
+rejectOrphanQty();
+flushItem();
+return rows.map((row) => ({ json: row }));
 ```
